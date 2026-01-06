@@ -3,27 +3,48 @@ import { v4 as uuid } from "uuid";
 
 /* ---------------- TYPES ---------------- */
 
+// Durable drawing events (event-sourced)
 type DrawEventInput =
   | { type: "stroke_start"; x: number; y: number }
   | { type: "stroke_move"; x: number; y: number }
   | { type: "stroke_end" };
 
 type DrawEvent = DrawEventInput & {
-  id: string; // global identity
-  seq: number; // ordering hint
-  source: "local" | "remote";
+  id: string;
+  seq: number;
+};
+
+// Ephemeral cursor presence (NOT event-sourced)
+type CursorPresence = {
+  userId: string;
+  x: number;
+  y: number;
+  color: string;
 };
 
 /* ---------------- APP ---------------- */
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const socketRef = useRef<WebSocket | null>(null);
 
+  // Session-only identity (no auth)
+  const userIdRef = useRef(uuid().slice(0, 6));
+  const userColorRef = useRef(
+    `hsl(${Math.floor(Math.random() * 360)}, 70%, 50%)`
+  );
+
+  // Event-sourced drawing state
   const [events, setEvents] = useState<DrawEvent[]>([]);
   const seenEventIds = useRef<Set<string>>(new Set());
+  const seqRef = useRef(0);
+
+  // Cursor presence state (ephemeral)
+  const [cursors, setCursors] = useState<Record<string, CursorPresence>>({});
 
   const [isDrawing, setIsDrawing] = useState(false);
-  const seqRef = useRef(0);
+
+  /* ---------------- SETUP ---------------- */
 
   useEffect(() => {
     const canvas = canvasRef.current!;
@@ -31,6 +52,32 @@ export default function App() {
     canvas.height = window.innerHeight;
     redraw(events);
   }, [events]);
+
+  useEffect(() => {
+    const socket = new WebSocket("ws://localhost:8080");
+    socketRef.current = socket;
+
+    socket.onmessage = (msg) => {
+      const data = JSON.parse(msg.data);
+
+      // Cursor presence message
+      if (data.type === "cursor") {
+        if (data.userId === userIdRef.current) return; // ignore self
+        setCursors((prev) => ({
+          ...prev,
+          [data.userId]: data,
+        }));
+        return;
+      }
+
+      // Drawing event
+      ingestEvent(data);
+    };
+
+    return () => socket.close();
+  }, []);
+
+  /* ---------------- CANVAS ---------------- */
 
   const getContext = () => {
     const ctx = canvasRef.current!.getContext("2d")!;
@@ -67,28 +114,24 @@ export default function App() {
   /* ---------------- EVENT INGESTION ---------------- */
 
   const ingestEvent = (event: DrawEvent) => {
-    if (seenEventIds.current.has(event.id)) {
-      return; // ❌ duplicate — reject
-    }
-
+    if (seenEventIds.current.has(event.id)) return;
     seenEventIds.current.add(event.id);
     setEvents((prev) => [...prev, event]);
   };
-
-  /* ---------------- LOCAL INPUT ---------------- */
 
   const createLocalEvent = (data: DrawEventInput): DrawEvent => ({
     ...data,
     id: uuid(),
     seq: seqRef.current++,
-    source: "local",
   });
 
   const addLocalEvent = (input: DrawEventInput) => {
     const event = createLocalEvent(input);
     ingestEvent(event);
-    simulateRemoteChaos(event);
+    socketRef.current?.send(JSON.stringify(event));
   };
+
+  /* ---------------- INPUT ---------------- */
 
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     addLocalEvent({ type: "stroke_start", x: e.clientX, y: e.clientY });
@@ -96,6 +139,18 @@ export default function App() {
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    // Cursor presence (ephemeral)
+    socketRef.current?.send(
+      JSON.stringify({
+        type: "cursor",
+        userId: userIdRef.current,
+        x: e.clientX,
+        y: e.clientY,
+        color: userColorRef.current,
+      })
+    );
+
+    // Drawing
     if (!isDrawing) return;
     addLocalEvent({ type: "stroke_move", x: e.clientX, y: e.clientY });
   };
@@ -106,33 +161,36 @@ export default function App() {
     setIsDrawing(false);
   };
 
-  /* ---------------- CHAOS MODE ---------------- */
-
-  const simulateRemoteChaos = (event: DrawEvent) => {
-    const copies = Math.floor(Math.random() * 3) + 1;
-
-    for (let i = 0; i < copies; i++) {
-      const delay = Math.random() * 1500;
-
-      setTimeout(() => {
-        const remoteCopy: DrawEvent = {
-          ...event,
-          source: "remote",
-        };
-
-        ingestEvent(remoteCopy);
-      }, delay);
-    }
-  };
+  /* ---------------- RENDER ---------------- */
 
   return (
-    <canvas
-      ref={canvasRef}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={stopDrawing}
-      onMouseLeave={stopDrawing}
-      style={{ display: "block" }}
-    />
+    <div style={{ position: "relative" }}>
+      <canvas
+        ref={canvasRef}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={stopDrawing}
+        onMouseLeave={stopDrawing}
+        style={{ display: "block" }}
+      />
+
+      {/* Cursor overlays */}
+      {Object.values(cursors).map((cursor) => (
+        <div
+          key={cursor.userId}
+          style={{
+            position: "absolute",
+            left: cursor.x,
+            top: cursor.y,
+            width: 10,
+            height: 10,
+            borderRadius: "50%",
+            backgroundColor: cursor.color,
+            pointerEvents: "none",
+            transform: "translate(-50%, -50%)",
+          }}
+        />
+      ))}
+    </div>
   );
 }
